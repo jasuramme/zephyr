@@ -151,6 +151,8 @@ enum uart_rx_stop_reason {
 	UART_ERROR_PARITY  = (1 << 1),
 	/** @brief Framing error */
 	UART_ERROR_FRAMING = (1 << 2),
+        /** @brief Noise error */
+        UART_ERROR_NOISE = (1 << 3),
 	/**
 	 * @brief Break interrupt
 	 *
@@ -158,7 +160,7 @@ enum uart_rx_stop_reason {
 	 * is held at a logic '0' state for longer than the sum of
 	 * start time + data bits + parity + stop bits.
 	 */
-	UART_BREAK = (1 << 3),
+        UART_BREAK = (1 << 4),
 };
 
 /** @brief UART TX event data. */

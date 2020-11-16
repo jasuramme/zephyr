@@ -11,8 +11,8 @@
 
 #ifndef ZEPHYR_DRIVERS_SERIAL_UART_STM32_H_
 #define ZEPHYR_DRIVERS_SERIAL_UART_STM32_H_
-
 #include <drivers/pinmux.h>
+#include <drivers/uart.h>
 
 /* device config */
 struct uart_stm32_config {
@@ -34,8 +34,29 @@ struct uart_stm32_data {
 	/* clock device */
 	const struct device *clock;
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
-	uart_irq_callback_user_data_t user_cb;
+        uart_irq_callback_user_data_t user_cb;
 	void *user_data;
+#endif
+#ifdef CONFIG_UART_ASYNC_API
+        uart_callback_t async_callback;
+
+        const uint8_t *volatile tx_buffer;
+        size_t tx_buffer_length;
+        size_t tx_counter;
+        bool tx_abort_pending;
+        struct k_timer *tx_timer;
+        atomic_t tx_buffer_lock;
+
+        uint8_t *volatile rx_buffer;
+        uint8_t *volatile rx_secondary_buffer;
+        size_t rx_buffer_length;
+        size_t rx_secondary_buffer_length;
+        size_t rx_counter;
+        size_t rx_offset;
+        int32_t rx_timeout;
+        struct k_timer *rx_timer;
+        atomic_t rx_buffer_lock;
+        atomic_t rx_secondary_buffer_lock;
 #endif
 };
 
