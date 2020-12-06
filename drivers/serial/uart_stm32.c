@@ -47,6 +47,366 @@ LOG_MODULE_REGISTER(uart_stm32);
 
 #define TIMEOUT 1000
 
+#ifdef CONFIG_UART_ASYNC_API
+#define STM32_UART_SECONDARY_BUFFER_TIMEOUT 1000
+
+#ifndef CONFIG_UART_INTERRUPT_DRIVEN
+#error Stm32 UART async driver needs UART_INTERRUPT_DRIVEN switched on
+#endif /* CONFIG_UART_INTERRUPT_DRIVEN */
+
+#define LOCKED 0
+#define UNLOCKED 1
+
+static void uart_stm32_irq_tx_enable(const struct device *dev);
+static void uart_stm32_irq_rx_enable(const struct device *dev);
+
+static int uart_stm32_resource_lock(atomic_t *lock){
+    if (*lock == LOCKED)
+        return -EBUSY;
+    bool success = atomic_cas ( lock,
+                                UNLOCKED,
+                                LOCKED);
+    if (!success)
+        return -EBUSY;
+
+    return 0;
+}
+
+static inline int uart_stm32_resource_unlock(atomic_t *lock){
+    *lock = UNLOCKED;
+    return 0;
+}
+
+static int uart_stm32_callback_set(const struct device *dev,
+                                          uart_callback_t callback,
+                                          void *user_data)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    data->async_callback = callback;
+    data->user_data = user_data;
+    return 0;
+}
+
+static int uart_stm32_tx(const struct device *dev, const uint8_t *buf,
+            size_t len,
+            int32_t timeout)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    if (len == 0 || dev == NULL)
+        return -ENOTSUP;
+
+    if (uart_stm32_resource_lock(&data->tx_buffer_lock) != 0)
+        return -EBUSY;
+
+    if (timeout != SYS_FOREVER_MS)
+        k_timer_start(data->tx_timer,
+                      K_MSEC(timeout),
+                      K_NO_WAIT);
+
+    uart_stm32_irq_tx_enable(dev);
+    data->tx_counter = 1;
+    data->tx_abort_pending = false;
+    data->tx_buffer = buf;
+    data->tx_buffer_length = len;
+    USART_TypeDef *UartInstance = UART_STRUCT(dev);
+    --data->tx_buffer_length;
+    LL_USART_TransmitData8(UartInstance, data->tx_buffer[0]);
+    return SUCCESS;
+}
+
+static void _uart_stm32_tx_finish(const struct device *dev,
+                              enum uart_event_type event)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    data->tx_buffer_length = 0;
+    data->tx_counter = 0;
+    data->tx_buffer = NULL;
+    data->tx_abort_pending = false;
+    k_timer_stop(data->tx_timer);
+    uart_stm32_resource_unlock(&data->tx_buffer_lock);
+    struct uart_event evt = {
+        .type = event,
+        .data.tx.buf = data->tx_buffer,
+        .data.tx.len = data->tx_buffer_length
+    };
+    if (data->async_callback != NULL)
+    {
+        data->async_callback(dev, &evt, data->user_data);
+    }
+}
+
+static int uart_stm32_tx_abort(const struct device *dev)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    if (data->tx_buffer_lock == LOCKED)
+    {
+        return -EFAULT;
+    }
+    data->tx_abort_pending = true;
+    return 0;
+}
+
+static inline void uart_stm32_tx_timeout(struct k_timer *timer,
+                                  const struct device *dev)
+{
+    UNUSED(timer);
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if (data->tx_buffer_lock == LOCKED)
+        data->tx_abort_pending = true;
+}
+
+static inline void uart_stm32_tx_isr(const struct device *dev,
+                                     struct uart_stm32_data *data,
+                                     USART_TypeDef *UartInstance)
+{
+    LL_USART_ClearFlag_TC(UartInstance);
+    if (data->tx_abort_pending)
+        _uart_stm32_tx_finish(dev, UART_TX_ABORTED);
+    else if (data->tx_counter <= data->tx_buffer_length)
+    {
+        LL_USART_TransmitData8(UartInstance, data->tx_buffer[data->tx_counter++]);
+    } else {
+        if (data->tx_buffer != NULL)
+            _uart_stm32_tx_finish(dev, UART_TX_DONE);
+    }
+}
+
+static void _uart_stm32_async_callback(const struct device *dev,
+                                     struct uart_event *evt)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if(data->async_callback != NULL)
+        data->async_callback(dev, evt, data->user_data);
+}
+
+static void _uart_stm32_rx_ready_callback(const struct device *dev)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if(data->async_callback != NULL)
+    {
+        struct uart_event evt = {
+            .type = UART_RX_RDY,
+        };
+        evt.data.rx.buf = data->rx_buffer;
+        evt.data.rx.len = data->rx_counter - data->rx_offset;
+        evt.data.rx.offset = data->rx_offset;
+
+        data->rx_offset = data->rx_counter;
+        data->async_callback(dev, &evt, data->user_data);
+    }
+}
+
+static void _uart_stm32_simple_callback(const struct device *dev,
+                                                enum uart_event_type event)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if(data->async_callback != NULL)
+    {
+        struct uart_event evt = {
+            .type = event
+        };
+        data->async_callback(dev, &evt, data->user_data);
+    }
+}
+
+static void _uart_stm32_stopped_callback(const struct device *dev,
+                                         enum uart_rx_stop_reason reason)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if(data->async_callback != NULL)
+    {
+        struct uart_event evt = {
+            .type = UART_RX_STOPPED,
+            .data.rx_stop.reason = reason
+        };
+        data->async_callback(dev, &evt, data->user_data);
+    }
+}
+
+static void _uart_stm32_rx_buffer_released_callback(const struct device *dev)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if(data->async_callback != NULL)
+    {
+        struct uart_event evt = {
+            .type = UART_RX_BUF_RELEASED,
+            .data.rx_buf.buf = data->rx_buffer
+        };
+        data->async_callback(dev, &evt, data->user_data);
+    }
+}
+
+
+static void _uart_stm32_reset_rx_buffer(struct uart_stm32_data *data)
+{
+    data->rx_buffer = NULL;
+    data->rx_offset = 0;
+    data->rx_buffer_length = 0;
+    data->rx_timeout = 0;
+    data->rx_counter = 0;
+}
+
+
+static int uart_stm32_rx_enable(const struct device *dev, uint8_t *buf,
+                   size_t len,
+                   int32_t timeout)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    if (len == 0 || dev == NULL)
+        return -ENOTSUP;
+
+    if (uart_stm32_resource_lock(&data->rx_buffer_lock) != 0)
+        return -EBUSY;
+
+    uart_stm32_irq_rx_enable(dev);
+    data->rx_buffer = buf;
+    data->rx_buffer_length = len;
+    data->rx_counter = 0;
+    data->rx_offset = 0;
+    data->rx_timeout = timeout;
+    data->rx_secondary_buffer = NULL;
+    data->rx_secondary_buffer_length = 0;
+
+    USART_TypeDef *UartInstance = UART_STRUCT(dev);
+    LL_USART_ClearFlag_ORE(UartInstance);
+    LL_USART_ClearFlag_NE(UartInstance);
+    LL_USART_ClearFlag_FE(UartInstance);
+    LL_USART_ClearFlag_PE(UartInstance);
+    return 0;
+}
+
+static int uart_stm32_rx_buf_rsp(const struct device *dev, uint8_t *buf,
+                size_t len)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    if (data->rx_secondary_buffer_length != 0)
+        return -EBUSY;
+
+    if (data->rx_secondary_buffer_lock == LOCKED)
+        return -EACCES;
+
+    if (uart_stm32_resource_lock(&data->rx_secondary_buffer_lock) != 0)
+        return -EBUSY;
+
+    data->rx_secondary_buffer = buf;
+    data->rx_secondary_buffer_length = len;
+
+    uart_stm32_resource_unlock(&data->rx_secondary_buffer_lock);
+    return 0;
+}
+
+static int uart_stm32_rx_disable(const struct device *dev){
+    struct uart_stm32_data *data = DEV_DATA(dev);
+
+    if (data->rx_buffer_lock == UNLOCKED)
+        return -EFAULT;
+
+    k_timer_stop(data->rx_timer);
+    uart_stm32_resource_unlock(&data->rx_buffer_lock);
+
+    struct uart_event evt = {
+        .type = UART_RX_DISABLED
+    };
+    _uart_stm32_async_callback(dev, &evt);
+
+    if (data->rx_counter > data->rx_offset)
+        _uart_stm32_rx_ready_callback(dev);
+
+    _uart_stm32_reset_rx_buffer(data);
+    return 0;
+}
+
+static void _uart_stm32_stop_with_error(const struct device *dev,
+                                        int err)
+{
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    enum uart_rx_stop_reason errors[] = {
+        UART_ERROR_OVERRUN,
+        UART_ERROR_FRAMING,
+        UART_ERROR_PARITY,
+        UART_ERROR_NOISE};
+
+    k_timer_stop(data->rx_timer);
+    uart_stm32_resource_unlock(&data->rx_buffer_lock);
+    _uart_stm32_rx_ready_callback(dev);
+    for (int i = 0; i < 4; ++i){
+        if (err & errors[i])
+            _uart_stm32_stopped_callback(dev, errors[i]);
+    }
+    _uart_stm32_rx_buffer_released_callback(dev);
+    _uart_stm32_simple_callback(dev, UART_RX_DISABLED);
+    _uart_stm32_reset_rx_buffer(data);
+}
+
+static inline void uart_stm32_rx_timeout(struct k_timer *timer,
+                                  const struct device *dev)
+{
+    UNUSED(timer);
+    _uart_stm32_rx_ready_callback(dev);
+}
+
+static inline void uart_stm32_rx_isr(const struct device *dev,
+                                           struct uart_stm32_data *data,
+                                           USART_TypeDef *UartInstance)
+{
+    uint8_t dr = LL_USART_ReceiveData8(UartInstance);
+    if (data->rx_buffer != NULL)
+    {
+        if (data->rx_counter < data->rx_buffer_length)
+        {
+            if (data->rx_counter == 0)
+            {
+                struct uart_event evt = {
+                    .type = UART_RX_BUF_REQUEST
+                };
+                _uart_stm32_async_callback(dev, &evt);
+            }
+
+            data->rx_buffer[data->rx_counter++] = dr;
+            if (data->rx_timeout != SYS_FOREVER_MS)
+                k_timer_start(data->rx_timer,
+                              K_MSEC(data->rx_timeout),
+                              K_NO_WAIT);
+
+            /* Is Rx buffer filled? */
+            if (data->rx_counter == data->rx_buffer_length)
+            {
+                if (data->rx_secondary_buffer == NULL)
+                {
+                    k_timer_stop(data->rx_timer);
+                    uart_stm32_resource_unlock(&data->rx_buffer_lock);
+                    _uart_stm32_rx_ready_callback(dev);
+                    _uart_stm32_rx_buffer_released_callback(dev);
+                    _uart_stm32_simple_callback(dev, UART_RX_DISABLED);
+                    _uart_stm32_reset_rx_buffer(data);
+                } else {
+                    _uart_stm32_rx_ready_callback(dev);
+                    _uart_stm32_rx_buffer_released_callback(dev);
+                    if (uart_stm32_resource_lock(&data->rx_secondary_buffer_lock) != 0)
+                    {
+                        _uart_stm32_simple_callback(dev, UART_RX_DISABLED);
+                    } else {
+                        data->rx_buffer = data->rx_secondary_buffer;
+                        data->rx_buffer_length = data->rx_secondary_buffer_length;
+                        data->rx_secondary_buffer = NULL;
+                        data->rx_secondary_buffer_length = 0;
+                        uart_stm32_resource_unlock(&data->rx_secondary_buffer_lock);
+                        data->rx_counter = 0;
+                        data->rx_offset = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif /* CONFIG_UART_ASYNC_API */
+
 static inline void uart_stm32_set_baudrate(const struct device *dev,
 					   uint32_t baud_rate)
 {
@@ -391,6 +751,13 @@ static int uart_stm32_config_get(const struct device *dev,
 
 static int uart_stm32_poll_in(const struct device *dev, unsigned char *c)
 {
+
+#ifdef CONFIG_UART_ASYNC_API
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if (uart_stm32_resource_lock(&data->rx_buffer_lock) != 0)
+        return -EBUSY;
+#endif /* CONFIG_UART_ASYNC_API */
+
 	USART_TypeDef *UartInstance = UART_STRUCT(dev);
 
 	/* Clear overrun error flag */
@@ -404,12 +771,22 @@ static int uart_stm32_poll_in(const struct device *dev, unsigned char *c)
 
 	*c = (unsigned char)LL_USART_ReceiveData8(UartInstance);
 
+#ifdef CONFIG_UART_ASYNC_API
+    uart_stm32_resource_unlock(&data->rx_buffer_lock);
+#endif /* CONFIG_UART_ASYNC_API */
+
 	return 0;
 }
 
 static void uart_stm32_poll_out(const struct device *dev,
 					unsigned char c)
 {
+    #ifdef CONFIG_UART_ASYNC_API
+    struct uart_stm32_data *data = DEV_DATA(dev);
+    if (uart_stm32_resource_lock(&data->rx_buffer_lock) != 0)
+        return;
+    #endif /* CONFIG_UART_ASYNC_API */
+
 	USART_TypeDef *UartInstance = UART_STRUCT(dev);
 
 	/* Wait for TXE flag to be raised */
@@ -419,17 +796,27 @@ static void uart_stm32_poll_out(const struct device *dev,
 	LL_USART_ClearFlag_TC(UartInstance);
 
 	LL_USART_TransmitData8(UartInstance, (uint8_t)c);
+
+    #ifdef CONFIG_UART_ASYNC_API
+    uart_stm32_resource_unlock(&data->rx_buffer_lock);
+    #endif /* CONFIG_UART_ASYNC_API */
 }
 
 static int uart_stm32_err_check(const struct device *dev)
 {
 	USART_TypeDef *UartInstance = UART_STRUCT(dev);
-	uint32_t err = 0U;
+
+    uint32_t err = 0U;
 
 	/* Check for errors, but don't clear them here.
 	 * Some SoC clear all error flags when at least
 	 * one is cleared. (e.g. F4X, F1X, and F2X)
 	 */
+
+    if (LL_USART_IsActiveFlag_NE(UartInstance)) {
+        err |= UART_ERROR_NOISE;
+    }
+
 	if (LL_USART_IsActiveFlag_ORE(UartInstance)) {
 		err |= UART_ERROR_OVERRUN;
 	}
@@ -454,10 +841,9 @@ static int uart_stm32_err_check(const struct device *dev)
 		LL_USART_ClearFlag_FE(UartInstance);
 	}
 
-	/* Clear noise error as well,
-	 * it is not represented by the errors enum
-	 */
-	LL_USART_ClearFlag_NE(UartInstance);
+    if (err & UART_ERROR_NOISE) {
+        LL_USART_ClearFlag_NE(UartInstance);
+    }
 
 	return err;
 }
@@ -568,7 +954,7 @@ static void uart_stm32_irq_err_enable(const struct device *dev)
 {
 	USART_TypeDef *UartInstance = UART_STRUCT(dev);
 
-	/* Enable FE, ORE interruptions */
+    /* Enable FE, ORE interruptions */
 	LL_USART_EnableIT_ERROR(UartInstance);
 #if !defined(CONFIG_SOC_SERIES_STM32F0X) || defined(USART_LIN_SUPPORT)
 	/* Enable Line break detection */
@@ -608,6 +994,7 @@ static int uart_stm32_irq_is_pending(const struct device *dev)
 
 static int uart_stm32_irq_update(const struct device *dev)
 {
+    UNUSED(dev);
 	return 1;
 }
 
@@ -625,14 +1012,56 @@ static void uart_stm32_isr(const struct device *dev)
 {
 	struct uart_stm32_data *data = DEV_DATA(dev);
 
-	if (data->user_cb) {
+    if (data->user_cb)
+    {
 		data->user_cb(dev, data->user_data);
 	}
+
+#ifdef CONFIG_UART_ASYNC_API
+    USART_TypeDef *UartInstance = UART_STRUCT(dev);
+
+    if (LL_USART_IsActiveFlag_TXE(UartInstance)){
+        uart_stm32_tx_isr(dev, data, UartInstance);
+    }
+
+    if (LL_USART_IsActiveFlag_RXNE(UartInstance)){
+        uart_stm32_rx_isr(dev, data, UartInstance);
+    }
+
+    if ((UartInstance->ISR &
+            ( USART_ISR_ORE |
+              USART_ISR_PE |
+              USART_ISR_FE |
+              USART_ISR_NE )) == 0 )
+        return;
+
+    int err = uart_stm32_err_check(dev);
+    if (err != 0){
+        if (err & UART_ERROR_PARITY)
+            _uart_stm32_stop_with_error(dev, UART_ERROR_PARITY);
+        if (err & UART_ERROR_FRAMING)
+            _uart_stm32_stop_with_error(dev, UART_ERROR_FRAMING);
+        if (err & UART_ERROR_OVERRUN)
+            _uart_stm32_stop_with_error(dev, UART_ERROR_FRAMING);
+        if (err & UART_ERROR_NOISE)
+            _uart_stm32_stop_with_error(dev, UART_ERROR_FRAMING);
+    }
+#endif
 }
 
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
 
 static const struct uart_driver_api uart_stm32_driver_api = {
+#ifdef CONFIG_UART_ASYNC_API
+
+    .callback_set = uart_stm32_callback_set,
+    .tx = uart_stm32_tx,
+    .tx_abort = uart_stm32_tx_abort,
+    .rx_enable = uart_stm32_rx_enable,
+    .rx_buf_rsp = uart_stm32_rx_buf_rsp,
+    .rx_disable = uart_stm32_rx_disable,
+
+#endif
 	.poll_in = uart_stm32_poll_in,
 	.poll_out = uart_stm32_poll_out,
 	.err_check = uart_stm32_err_check,
@@ -747,23 +1176,32 @@ static int uart_stm32_init(const struct device *dev)
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	config->uconf.irq_config_func(dev);
 #endif
+
+#ifdef CONFIG_UART_ASYNC_API
+    data->tx_buffer_lock = UNLOCKED;
+    data->rx_buffer_lock = UNLOCKED;
+    data->rx_secondary_buffer_lock = UNLOCKED;
+    data->async_callback = NULL;
+    _uart_stm32_reset_rx_buffer(data);
+#endif
 	return 0;
 }
 
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
-#define STM32_UART_IRQ_HANDLER_DECL(index)				\
+#define STM32_UART_IRQ_HANDLER_DECL(index)                                      \
 	static void uart_stm32_irq_config_func_##index(const struct device *dev)
-#define STM32_UART_IRQ_HANDLER_FUNC(index)				\
+#define STM32_UART_IRQ_HANDLER_FUNC(index)                                      \
 	.irq_config_func = uart_stm32_irq_config_func_##index,
-#define STM32_UART_IRQ_HANDLER(index)					\
-static void uart_stm32_irq_config_func_##index(const struct device *dev)	\
-{									\
-	IRQ_CONNECT(DT_INST_IRQN(index),				\
-		DT_INST_IRQ(index, priority),				\
-		uart_stm32_isr, DEVICE_GET(uart_stm32_##index),		\
-		0);							\
-	irq_enable(DT_INST_IRQN(index));				\
+#define STM32_UART_IRQ_HANDLER(index)                                           \
+static void uart_stm32_irq_config_func_##index(const struct device *dev)        \
+{                                                                               \
+    UNUSED(dev);                                                                \
+    IRQ_CONNECT(DT_INST_IRQN(index),                                            \
+        DT_INST_IRQ(index, priority),                                           \
+        uart_stm32_isr, DEVICE_GET(uart_stm32_##index),                         \
+        0);                                                                     \
+    irq_enable(DT_INST_IRQN(index));                                            \
 }
 #else
 #define STM32_UART_IRQ_HANDLER_DECL(index)
@@ -771,36 +1209,64 @@ static void uart_stm32_irq_config_func_##index(const struct device *dev)	\
 #define STM32_UART_IRQ_HANDLER(index)
 #endif
 
-#define STM32_UART_INIT(index)						\
-STM32_UART_IRQ_HANDLER_DECL(index);					\
-									\
-static const struct soc_gpio_pinctrl uart_pins_##index[] =		\
-				ST_STM32_DT_INST_PINCTRL(index, 0);	\
-									\
-static const struct uart_stm32_config uart_stm32_cfg_##index = {	\
-	.uconf = {							\
-		.base = (uint8_t *)DT_INST_REG_ADDR(index),		\
-		STM32_UART_IRQ_HANDLER_FUNC(index)			\
-	},								\
-	.pclken = { .bus = DT_INST_CLOCKS_CELL(index, bus),		\
-		    .enr = DT_INST_CLOCKS_CELL(index, bits)		\
-	},								\
-	.hw_flow_control = DT_INST_PROP(index, hw_flow_control),	\
-	.parity = DT_INST_PROP_OR(index, parity, UART_CFG_PARITY_NONE),	\
-	.pinctrl_list = uart_pins_##index,				\
-	.pinctrl_list_size = ARRAY_SIZE(uart_pins_##index),		\
-};									\
-									\
-static struct uart_stm32_data uart_stm32_data_##index = {		\
-	.baud_rate = DT_INST_PROP(index, current_speed),		\
-};									\
-									\
-DEVICE_AND_API_INIT(uart_stm32_##index, DT_INST_LABEL(index),		\
-		    &uart_stm32_init,					\
-		    &uart_stm32_data_##index, &uart_stm32_cfg_##index,	\
-		    PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,	\
-		    &uart_stm32_driver_api);				\
-									\
+#ifdef CONFIG_UART_ASYNC_API
+#define STM32_UART_ASYNC_TIMERS_DECL(index)                                     \
+static void uart_stm32_timer_rx_callback_##index(struct k_timer *timer);        \
+static void uart_stm32_timer_tx_callback_##index(struct k_timer *timer);        \
+K_TIMER_DEFINE(uart_stm32_timer_rx_##index,                                     \
+                   uart_stm32_timer_rx_callback_##index, NULL);                 \
+K_TIMER_DEFINE(uart_stm32_timer_tx_##index,                                     \
+                   uart_stm32_timer_tx_callback_##index, NULL);
+#define STM32_UART_ASYNC_TIMERS_IMPL(index)                                     \
+static void uart_stm32_timer_rx_callback_##index(struct k_timer *timer) {       \
+    uart_stm32_rx_timeout(timer, DEVICE_GET(uart_stm32_##index));               \
+};                                                                              \
+static void uart_stm32_timer_tx_callback_##index(struct k_timer *timer) {       \
+    uart_stm32_tx_timeout(timer, DEVICE_GET(uart_stm32_##index));               \
+};
+#define STM32_UART_ASYNC_DATA_INIT(index)                                       \
+    .rx_timer = &uart_stm32_timer_rx_##index,                                   \
+    .tx_timer = &uart_stm32_timer_rx_##index
+#else
+#define STM32_UART_ASYNC_TIMERS_DECL(index)
+#define STM32_UART_ASYNC_DATA_INIT(index)
+#define STM32_UART_ASYNC_TIMERS_IMPL(index)
+#endif
+
+
+#define STM32_UART_INIT(index)                                                  \
+STM32_UART_IRQ_HANDLER_DECL(index);                                             \
+STM32_UART_ASYNC_TIMERS_DECL(index)                                             \
+                                                                                \
+static const struct soc_gpio_pinctrl uart_pins_##index[] =                      \
+                ST_STM32_DT_INST_PINCTRL(index, 0);                             \
+                                                                                \
+static const struct uart_stm32_config uart_stm32_cfg_##index = {                \
+    .uconf = {                                                                  \
+        .base = (uint8_t *)DT_INST_REG_ADDR(index),                             \
+        STM32_UART_IRQ_HANDLER_FUNC(index)                                      \
+    },                                                                          \
+    .pclken = { .bus = DT_INST_CLOCKS_CELL(index, bus),                         \
+            .enr = DT_INST_CLOCKS_CELL(index, bits)                             \
+    },                                                                          \
+    .hw_flow_control = DT_INST_PROP(index, hw_flow_control),                    \
+    .parity = DT_INST_PROP_OR(index, parity, UART_CFG_PARITY_NONE),             \
+    .pinctrl_list = uart_pins_##index,                                          \
+    .pinctrl_list_size = ARRAY_SIZE(uart_pins_##index),                         \
+};                                                                              \
+                                                                                \
+static struct uart_stm32_data uart_stm32_data_##index = {                       \
+    .baud_rate = DT_INST_PROP(index, current_speed),                            \
+    STM32_UART_ASYNC_DATA_INIT(index)                                           \
+};                                                                              \
+                                                                                \
+DEVICE_AND_API_INIT(uart_stm32_##index, DT_INST_LABEL(index),                   \
+            &uart_stm32_init,                                                   \
+            &uart_stm32_data_##index, &uart_stm32_cfg_##index,                  \
+            PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,                   \
+            &uart_stm32_driver_api);                                            \
+                                                                                \
+STM32_UART_ASYNC_TIMERS_IMPL(index)                                             \
 STM32_UART_IRQ_HANDLER(index)
 
 DT_INST_FOREACH_STATUS_OKAY(STM32_UART_INIT)
